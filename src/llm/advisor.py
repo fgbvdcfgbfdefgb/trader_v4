@@ -480,8 +480,25 @@ class AdvisorCache:
         self.journal = None
         self.path = path
 
-        candidates = [path]
         tmp = os.environ.get("TMPDIR") or tempfile.gettempdir()
+        # Escape hatch: TRADER_V4_CACHE_BACKEND=jsonl forces the lock-free
+        # backend without touching code, and it propagates to spawned workers.
+        forced = os.environ.get("TRADER_V4_CACHE_BACKEND", "").strip().lower()
+        if forced == "jsonl":
+            self.backend = "jsonl"
+            base = path if path.endswith(".jsonl") else path + ".jsonl"
+            try:
+                os.makedirs(os.path.dirname(os.path.abspath(base)), exist_ok=True)
+            except OSError:
+                base = os.path.join(tmp, "trader_v4_advisor.jsonl")
+            self.path = base
+            self._json = _JsonlBackend(base)
+            if verbose:
+                print(f"[advisor-cache] backend forced to JSONL at {base}",
+                      flush=True)
+            return
+
+        candidates = [path]
         alt = os.path.join(tmp, "trader_v4_advisor.sqlite")
         if os.path.abspath(alt) != os.path.abspath(path):
             candidates.append(alt)
