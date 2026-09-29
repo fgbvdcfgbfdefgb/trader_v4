@@ -27,6 +27,7 @@ import math
 import os
 import re
 import sqlite3
+import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -334,78 +335,270 @@ def parse_response(raw: str) -> AdvisorSignal | None:
 # --------------------------------------------------------------------------- #
 #  multi-process cache
 # --------------------------------------------------------------------------- #
+class _JsonlBackend:
+    """
+    Lock-free append-only fallback for filesystems where SQLite cannot run.
+
+    One JSON object per line.  POSIX guarantees that an O_APPEND write
+    smaller than PIPE_BUF (4 KB) is atomic, and our records are ~300 bytes,
+    so concurrent trainers and the daemon can all append safely without any
+    locking primitive -- which is precisely what the FUSE mount lacks.
+    Readers reload when the file's mtime changes.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self.req_path = path + ".req"
+        self._mem: dict[tuple[str, str], dict] = {}
+        self._req: dict[tuple[str, str], int] = {}
+        self._mtime = -1.0
+        self._reload()
+
+    def _reload(self) -> None:
+        for path, sink, is_req in ((self.path, self._mem, False),
+                                   (self.req_path, self._req, True)):
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path) as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            r = json.loads(line)
+                        except Exception:  # noqa: BLE001
+                            continue
+                        k = (r["coin"], r["day"])
+                        if is_req:
+                            sink[k] = sink.get(k, 0) + 1
+                        else:
+                            sink[k] = r["payload"]
+            except OSError:
+                pass
+        try:
+            self._mtime = os.path.getmtime(self.path)
+        except OSError:
+            self._mtime = -1.0
+
+    def _maybe_reload(self) -> None:
+        try:
+            m = os.path.getmtime(self.path)
+        except OSError:
+            return
+        if m != self._mtime:
+            self._mem.clear()
+            self._req.clear()
+            self._reload()
+
+    def _append(self, path: str, rec: dict) -> None:
+        try:
+            with open(path, "a") as fh:
+                fh.write(json.dumps(rec) + "\n")
+        except OSError:
+            pass
+
+    def get(self, coin, day):
+        self._maybe_reload()
+        return self._mem.get((coin, day))
+
+    def put(self, coin, day, payload):
+        self._mem[(coin, day)] = payload
+        self._append(self.path, {"coin": coin, "day": day, "payload": payload})
+        try:
+            self._mtime = os.path.getmtime(self.path)
+        except OSError:
+            pass
+
+    def request(self, coin, day):
+        self._req[(coin, day)] = self._req.get((coin, day), 0) + 1
+        self._append(self.req_path, {"coin": coin, "day": day})
+
+    def pending(self, limit):
+        self._maybe_reload()
+        out = [(k, n) for k, n in self._req.items() if k not in self._mem]
+        out.sort(key=lambda x: -x[1])
+        return [k for k, _ in out[:limit]]
+
+    def stats(self):
+        self._maybe_reload()
+        return {"verdicts": len(self._mem), "requests": len(self._req),
+                "pending": sum(1 for k in self._req if k not in self._mem)}
+
+
+def _open_sqlite(path: str, timeout: float):
+    """
+    Open a SQLite db and prove it actually works on this filesystem.
+
+    Snowflake workspaces live on a FUSE mount that does not implement the
+    shared-memory locking WAL needs, so `PRAGMA journal_mode=WAL` followed by
+    a write raises SQLITE_IOERR.  Rather than guess, we try progressively
+    weaker journal modes and only accept one after a real write round-trip.
+    """
+    try:
+        conn = sqlite3.connect(path, timeout=timeout, isolation_level=None,
+                               check_same_thread=False)
+    except sqlite3.Error:
+        return None, None
+    for mode in ("WAL", "TRUNCATE", "DELETE", "MEMORY"):
+        try:
+            conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute(f"PRAGMA journal_mode={mode}")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("CREATE TABLE IF NOT EXISTS _probe(x INTEGER)")
+            conn.execute("INSERT INTO _probe VALUES (1)")
+            conn.execute("DELETE FROM _probe")
+            return conn, mode
+        except sqlite3.Error:
+            continue
+    try:
+        conn.close()
+    except sqlite3.Error:
+        pass
+    return None, None
+
+
 class AdvisorCache:
     """
-    SQLite (WAL) cache shared by every GPU trainer and the CPU LLM daemon.
+    Verdict cache shared by every GPU trainer and the CPU LLM daemon.
 
-    verdicts : the parsed signal for a (coin, day)
-    requests : days the trainers wanted but did not find, so the daemon knows
-               what to work on next and in what priority order
+    Storage is negotiated at startup, because the training host's filesystem
+    is not guaranteed to support SQLite locking:
+
+        1. SQLite at the requested path  (WAL -> TRUNCATE -> DELETE -> MEMORY)
+        2. SQLite in the system temp dir
+        3. an append-only JSONL file, which needs no locking at all
+
+    Every method is defensive: a cache problem must degrade the advisor to
+    the numeric prior, never take down a training run.
     """
 
-    def __init__(self, path: str, timeout: float = 30.0):
-        self.path = path
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    def __init__(self, path: str, timeout: float = 30.0, verbose: bool = True):
         self.timeout = timeout
         self._local = threading.local()
-        with self._conn() as c:
-            c.execute("PRAGMA journal_mode=WAL")
-            c.execute("PRAGMA synchronous=NORMAL")
-            c.execute("""CREATE TABLE IF NOT EXISTS verdicts(
+        self.backend = "sqlite"
+        self.journal = None
+        self.path = path
+
+        candidates = [path]
+        tmp = os.environ.get("TMPDIR") or tempfile.gettempdir()
+        alt = os.path.join(tmp, "trader_v4_advisor.sqlite")
+        if os.path.abspath(alt) != os.path.abspath(path):
+            candidates.append(alt)
+
+        conn = None
+        for cand in candidates:
+            try:
+                d = os.path.dirname(os.path.abspath(cand))
+                if d:
+                    os.makedirs(d, exist_ok=True)
+            except OSError:
+                continue
+            conn, mode = _open_sqlite(cand, timeout)
+            if conn is not None:
+                self.path, self.journal = cand, mode
+                break
+
+        if conn is None:
+            self.backend = "jsonl"
+            base = path if path.endswith(".jsonl") else path + ".jsonl"
+            try:
+                os.makedirs(os.path.dirname(os.path.abspath(base)), exist_ok=True)
+            except OSError:
+                base = os.path.join(tmp, "trader_v4_advisor.jsonl")
+            self.path = base
+            self._json = _JsonlBackend(base)
+            if verbose:
+                print(f"[advisor-cache] SQLite unusable here -> append-only "
+                      f"JSONL at {base}", flush=True)
+            return
+
+        try:
+            conn.execute("""CREATE TABLE IF NOT EXISTS verdicts(
                 coin TEXT, day TEXT, payload TEXT, created REAL,
                 PRIMARY KEY(coin, day))""")
-            c.execute("""CREATE TABLE IF NOT EXISTS requests(
+            conn.execute("""CREATE TABLE IF NOT EXISTS requests(
                 coin TEXT, day TEXT, hits INTEGER DEFAULT 1, last REAL,
                 PRIMARY KEY(coin, day))""")
-            c.commit()
+            conn.execute("DROP TABLE IF EXISTS _probe")
+        except sqlite3.Error:
+            pass
+        self._local.c = conn
+        if verbose:
+            note = "" if self.path == path else f" (fell back from {path})"
+            print(f"[advisor-cache] sqlite journal={self.journal} "
+                  f"at {self.path}{note}", flush=True)
 
+    # ------------------------------------------------------------------ #
     def _conn(self) -> sqlite3.Connection:
         if not hasattr(self._local, "c"):
-            self._local.c = sqlite3.connect(self.path, timeout=self.timeout,
-                                            isolation_level=None)
-            self._local.c.execute("PRAGMA busy_timeout=30000")
+            c, mode = _open_sqlite(self.path, self.timeout)
+            if c is None:
+                raise sqlite3.OperationalError("cannot reopen advisor cache")
+            self._local.c = c
         return self._local.c
 
+    # ------------------------------------------------------------------ #
     def get(self, coin: str, day: date) -> AdvisorSignal | None:
-        r = self._conn().execute(
-            "SELECT payload FROM verdicts WHERE coin=? AND day=?",
-            (coin, day.isoformat())).fetchone()
-        if not r:
-            return None
         try:
-            return AdvisorSignal(**json.loads(r[0]))
+            if self.backend == "jsonl":
+                raw = self._json.get(coin, day.isoformat())
+                return AdvisorSignal(**raw) if raw else None
+            r = self._conn().execute(
+                "SELECT payload FROM verdicts WHERE coin=? AND day=?",
+                (coin, day.isoformat())).fetchone()
+            return AdvisorSignal(**json.loads(r[0])) if r else None
         except Exception:  # noqa: BLE001
             return None
 
     def put(self, coin: str, day: date, sig: AdvisorSignal) -> None:
-        self._conn().execute(
-            "INSERT OR REPLACE INTO verdicts VALUES (?,?,?,?)",
-            (coin, day.isoformat(), json.dumps(asdict(sig)), time.time()))
+        try:
+            if self.backend == "jsonl":
+                self._json.put(coin, day.isoformat(), asdict(sig))
+                return
+            self._conn().execute(
+                "INSERT OR REPLACE INTO verdicts VALUES (?,?,?,?)",
+                (coin, day.isoformat(), json.dumps(asdict(sig)), time.time()))
+        except Exception:  # noqa: BLE001
+            pass
 
     def request(self, coin: str, day: date) -> None:
         try:
+            if self.backend == "jsonl":
+                self._json.request(coin, day.isoformat())
+                return
+            now = time.time()
             self._conn().execute(
                 "INSERT INTO requests(coin,day,hits,last) VALUES(?,?,1,?) "
                 "ON CONFLICT(coin,day) DO UPDATE SET hits=hits+1, last=?",
-                (coin, day.isoformat(), time.time(), time.time()))
-        except sqlite3.OperationalError:
+                (coin, day.isoformat(), now, now))
+        except Exception:  # noqa: BLE001
             pass  # a busy cache must never stall an env step
 
     def pending(self, limit: int = 64) -> list[tuple[str, str]]:
-        """Most-requested un-answered days first."""
-        return self._conn().execute(
-            "SELECT r.coin, r.day FROM requests r "
-            "LEFT JOIN verdicts v ON v.coin=r.coin AND v.day=r.day "
-            "WHERE v.day IS NULL ORDER BY r.hits DESC, r.last DESC LIMIT ?",
-            (limit,)).fetchall()
+        try:
+            if self.backend == "jsonl":
+                return self._json.pending(limit)
+            return self._conn().execute(
+                "SELECT r.coin, r.day FROM requests r "
+                "LEFT JOIN verdicts v ON v.coin=r.coin AND v.day=r.day "
+                "WHERE v.day IS NULL ORDER BY r.hits DESC, r.last DESC LIMIT ?",
+                (limit,)).fetchall()
+        except Exception:  # noqa: BLE001
+            return []
 
     def stats(self) -> dict:
-        c = self._conn()
-        return {
-            "verdicts": c.execute("SELECT COUNT(*) FROM verdicts").fetchone()[0],
-            "requests": c.execute("SELECT COUNT(*) FROM requests").fetchone()[0],
-            "pending": c.execute(
-                "SELECT COUNT(*) FROM requests r LEFT JOIN verdicts v "
-                "ON v.coin=r.coin AND v.day=r.day WHERE v.day IS NULL"
-            ).fetchone()[0],
-        }
+        try:
+            if self.backend == "jsonl":
+                return self._json.stats()
+            c = self._conn()
+            return {
+                "verdicts": c.execute("SELECT COUNT(*) FROM verdicts").fetchone()[0],
+                "requests": c.execute("SELECT COUNT(*) FROM requests").fetchone()[0],
+                "pending": c.execute(
+                    "SELECT COUNT(*) FROM requests r LEFT JOIN verdicts v "
+                    "ON v.coin=r.coin AND v.day=r.day WHERE v.day IS NULL"
+                ).fetchone()[0],
+            }
+        except Exception:  # noqa: BLE001
+            return {"verdicts": 0, "requests": 0, "pending": 0}
