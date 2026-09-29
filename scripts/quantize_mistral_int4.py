@@ -57,9 +57,52 @@ EMBED_CHUNK_ROWS = 8192            # 8192 x 4096 fp16 = 67 MB
 
 
 def bf16_to_f32(raw: np.ndarray, shape) -> np.ndarray:
-    """bfloat16 == the top 16 bits of a float32, so shift left and reinterpret."""
-    u16 = raw.view(np.uint16).astype(np.uint32)
-    return ((u16 << 16).view(np.float32)).reshape(shape)
+    """
+    bfloat16 == the top 16 bits of a float32: shift left and reinterpret.
+
+    Done in chunks on purpose.  The naive one-liner allocates TWO uint32
+    temporaries the size of the output at once -- for Mistral's 32768x4096
+    embedding table that is 268 MB in + 537 MB + 537 MB, which OOM-kills a
+    2 GB box.  Chunking caps the temporaries at ~32 MB.
+    """
+    u16 = raw.view(np.uint16)
+    out = np.empty(u16.size, dtype=np.float32)
+    CH = 1 << 22
+    for i in range(0, u16.size, CH):
+        sl = u16[i:i + CH]
+        out[i:i + sl.size] = (sl.astype(np.uint32) << 16).view(np.float32)
+    return out.reshape(shape)
+
+
+def read_tensor_f32(path: str, hlen: int, info: dict) -> np.ndarray:
+    s0, e0 = info["data_offsets"]
+    with open(path, "rb") as fh:
+        fh.seek(8 + hlen + s0)
+        buf = np.frombuffer(fh.read(e0 - s0), dtype=np.uint8)
+    if info["dtype"] == "BF16":
+        arr = bf16_to_f32(buf, info["shape"])
+    else:
+        arr = np.frombuffer(buf, dtype=np.float32).reshape(info["shape"]).copy()
+    del buf
+    return arr
+
+
+def read_rows_f32(path: str, hlen: int, info: dict, r0: int, r1: int) -> np.ndarray:
+    """Read rows [r0, r1) of a 2-D tensor without materialising the whole thing."""
+    s0, _ = info["data_offsets"]
+    rows, cols = info["shape"]
+    esz = 2 if info["dtype"] == "BF16" else 4
+    start = 8 + hlen + s0 + r0 * cols * esz
+    n = (r1 - r0) * cols * esz
+    with open(path, "rb") as fh:
+        fh.seek(start)
+        buf = np.frombuffer(fh.read(n), dtype=np.uint8)
+    if info["dtype"] == "BF16":
+        arr = bf16_to_f32(buf, (r1 - r0, cols))
+    else:
+        arr = np.frombuffer(buf, dtype=np.float32).reshape(r1 - r0, cols).copy()
+    del buf
+    return arr
 
 
 def quantize_rows(w: np.ndarray, group: int, n_grid: int = 10):
@@ -200,8 +243,12 @@ class BinWriter:
             return
         self.n += 1
         fn = f"q-{self.n:05d}.safetensors"
-        save_file(self.buf, os.path.join(self.outdir, fn),
+        dest = os.path.join(self.outdir, fn)
+        # write to a temp file then rename: a kill mid-write must never leave
+        # a truncated shard behind (we overwrite the previous run in place)
+        save_file(self.buf, dest + ".tmp",
                   metadata={"format": f"trader_v4-int4-g{self.group}"})
+        os.replace(dest + ".tmp", dest)
         for k in self.pending:
             self.index[k] = fn
         sz = os.path.getsize(os.path.join(self.outdir, fn))
@@ -263,33 +310,31 @@ def main() -> int:
         for ki, k in enumerate(keys):
             info = header[k]
             shape = info["shape"]
-            s, e = info["data_offsets"]
-            with open(src, "rb") as raw:
-                raw.seek(8 + hlen + s)
-                buf = np.frombuffer(raw.read(e - s), dtype=np.uint8)
-            arr = (bf16_to_f32(buf, shape) if info["dtype"] == "BF16"
-                   else np.frombuffer(buf, dtype=np.float32).reshape(shape))
-            del buf
-
             is_embed = "embed_tokens" in k
             is_lin = (len(shape) == 2 and not is_embed
                       and shape[1] % args.group == 0)
 
             if is_embed:
-                # keep fp16, split into row-chunks so each blob stays < 90 MB
+                # read + convert one row-chunk at a time; the full fp32 table
+                # would be 537 MB and this box has under 2 GB
                 rows = shape[0]
                 nch = 0
                 for r0 in range(0, rows, EMBED_CHUNK_ROWS):
                     r1 = min(r0 + EMBED_CHUNK_ROWS, rows)
-                    writer.add(f"{k}.chunk{nch}", arr[r0:r1].astype(np.float16))
+                    part = read_rows_f32(src, hlen, info, r0, r1)
+                    writer.add(f"{k}.chunk{nch}", part.astype(np.float16))
+                    del part
+                    gc.collect()
                     nch += 1
                 meta[k] = {"kind": "fp16_chunked", "shape": list(shape),
                            "chunks": nch, "chunk_rows": EMBED_CHUNK_ROWS}
                 n_fp += 1
             elif is_lin:
+                arr = read_tensor_f32(src, hlen, info)
                 pk, sc, ze = quantize_rows(arr, args.group, args.clip_grid)
                 if ki % 40 == 0:
                     errs.append(dequant_check(pk, sc, ze, arr, args.group))
+                del arr
                 writer.add(k + ".qweight", pk)
                 writer.add(k + ".scale", sc)
                 writer.add(k + ".zero", ze)
@@ -298,15 +343,20 @@ def main() -> int:
                 n_q += 1
                 del pk, sc, ze
             else:
+                arr = read_tensor_f32(src, hlen, info)
                 writer.add(k, arr.astype(np.float16))
                 meta[k] = {"kind": "fp16", "shape": list(shape)}
                 n_fp += 1
+                del arr
 
-            del arr
-            if ki % 25 == 0:
+            if ki % 10 == 0:
                 gc.collect()
-                print(f"    [{ki+1}/{len(keys)}] {k}  ({time.time()-t0:.0f}s)",
-                      flush=True)
+                try:
+                    rss = int(open("/proc/self/statm").read().split()[1]) * 4096 / 1e6
+                except Exception:  # noqa: BLE001
+                    rss = -1
+                print(f"    [{ki+1}/{len(keys)}] {k}  "
+                      f"({time.time()-t0:.0f}s, rss {rss:.0f} MB)", flush=True)
 
         if not args.keep_shards:
             os.remove(src)
