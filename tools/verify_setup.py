@@ -115,13 +115,40 @@ def main() -> int:
         for f in ("config.json", "tokenizer.json", "tokenizer_config.json"):
             check(os.path.exists(f"{md}/{f}"), f"{f}")
 
-    section("6. Load the dataset for real")
+    section("6. Advisor cache (filesystem capability probe)")
+    # Snowflake workspaces sit on a FUSE mount that cannot do the shared-memory
+    # locking SQLite's WAL needs. Probe it here rather than crashing an agent.
+    try:
+        from src.llm.advisor import AdvisorCache
+        from datetime import date as _d
+        cp = os.path.join("runs", "_verify", "probe.sqlite")
+        c = AdvisorCache(cp)
+        from src.llm.advisor import AdvisorSignal
+        c.put("BTC", _d(2024, 1, 1), AdvisorSignal(bias=1, conviction=2))
+        got = c.get("BTC", _d(2024, 1, 1))
+        check(got is not None and got.bias == 1,
+              f"cache read/write ok  (backend={c.backend}"
+              + (f", journal={c.journal}" if c.journal else "") + ")")
+        if os.path.abspath(c.path) != os.path.abspath(cp):
+            print(f"         note: this filesystem forced a fallback to {c.path}")
+        import shutil as _sh
+        _sh.rmtree(os.path.join("runs", "_verify"), ignore_errors=True)
+        for _f in (c.path, c.path + ".req", c.path + "-wal", c.path + "-shm"):
+            if os.path.exists(_f) and "_verify" not in _f and "trader_v4_advisor" in _f:
+                try:
+                    os.remove(_f)
+                except OSError:
+                    pass
+    except Exception as exc:  # noqa: BLE001
+        check(False, f"advisor cache unusable: {exc}", fatal=False)
+
+    section("7. Load the dataset for real")
     try:
         from src.data.loader import Dataset
         ds = Dataset("data", verbose=True)
         n_days = sum(len(v) for v in ds.days.values())
         check(n_days > 100, f"{n_days} tradable day-episodes available")
-        section("7. Build one episode end to end")
+        section("8. Build one episode end to end")
         from src.envs.trading_env import TradingEnv
         env = TradingEnv(ds, None, use_llm=False, seed=0)
         o = env.reset()
