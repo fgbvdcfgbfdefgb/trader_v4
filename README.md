@@ -21,7 +21,7 @@ python train.py --epochs 2000    # one agent per GPU, resumable
 |---|---|---|
 | `data/minute/<SYM>/<YEAR>.parquet` | 1-minute OHLCV, BTC/ETH/LTC, **Aug 2017 → Sep 2026** | ~330 MB |
 | `data/daily/market_daily.parquet` | 26 daily market-moving features | 0.2 MB |
-| `data/news/headlines/<YEAR>.jsonl.gz` | per-(day, coin) headlines | ~3 MB |
+| `data/news/headlines/<YEAR>.jsonl.gz` | per-(day, coin) headlines, 40k+ | ~1.5 MB |
 | `models/mistral7b-int4/` | Mistral-7B-Instruct-v0.3 in int4, 53 shards | ~4.0 GB |
 | `src/`, `train.py` | the trainer | ~150 KB |
 | `scripts/` | the downloaders that built `data/` (for reproducibility) | — |
@@ -168,6 +168,44 @@ python train.py --no-resume            # start over
 
 ## 7. Running on Snowflake
 
+### If `verify_setup.py` says the model is missing
+
+```
+[warn] models/mistral7b-int4/quant_manifest.json
+[main] !! models/mistral7b-int4 not found -- agents will use the numeric prior only
+```
+
+That means your workspace was synced **before** the 4 GB model was pushed. The
+repo has it now (53 shards, `models/mistral7b-int4/`). Re-fetch:
+
+```sql
+-- SQL worksheet
+ALTER GIT REPOSITORY <your_repo_name> FETCH;
+```
+
+or in Snowsight: **Workspaces → your workspace → the Git/branch control → Pull**.
+
+Training keeps working meanwhile — the agents just use the numeric prior, which
+is always available. Nothing is lost by starting now and re-syncing later: the
+advisor cache is keyed by (coin, day) and fills in whenever the model appears.
+
+### Tuning for your instance
+
+On a single **A10G (24 GB) + 8 vCPU** node:
+
+```bash
+# two agents on the one GPU -> population search over hyper-parameters
+python train.py --agents 2 --llm-threads 5 --llm-batch-size 8
+
+# if the node has >= 20 GB free RAM, dequantise the LLM once: far faster
+python train.py --agents 2 --llm-materialize --llm-dtype bfloat16 --llm-threads 6
+```
+
+The policy network is tiny (~200k params), so GPU memory is never the constraint
+— the CPU-side LLM is. Give it as many threads as you can spare and keep
+`--llm-batch-size` at 8 or higher.
+
+
 The image already has torch 2.13, transformers 5.17, safetensors, pandas, pyarrow
 and matplotlib. Nothing else is needed — **no pip install**.
 
@@ -244,11 +282,12 @@ All are resumable and skip work that's already on disk.
 ## 10. Known limitations
 
 - **News coverage is uneven.** GDELT rate-limits to 1 request / 5 s per IP, so a full
-  2017→2026 daily crawl takes ~5 hours; the shipped headlines come mostly from HN
-  Algolia, which is fast and unthrottled but tech-skewed. **LTC coverage is thin.**
-  Days without headlines fall back to the numeric prior, which is always available.
-  Run `scripts/download_news.py` to top up from GDELT — it's resumable and merges
-  into the same store.
+  2017→2026 daily crawl takes ~5 hours; the shipped headlines (40k+) come from HN
+  Algolia, which is fast and unthrottled but tech-skewed, and is densest from 2020
+  onward. LTC has only ~50 days of *direct* coverage, so LTC days are served by the
+  market-wide BTC fallback described in §3. Days with nothing at all fall back to the
+  numeric prior. Run `scripts/download_news.py` to top up from GDELT — it's resumable
+  and merges into the same store.
 - **int4 RTN is not GPTQ.** Clip search narrows the gap but a calibration-based
   method would be better. Good enough for a 5-field classification; don't expect
   long-form reasoning.
