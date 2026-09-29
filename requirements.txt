@@ -1,0 +1,11 @@
+# The Snowflake ML runtime already satisfies all of these -- listed for
+# reproducibility on other hosts. Nothing here needs to be installed on the
+# training machine.
+torch>=2.1
+numpy>=1.24
+pandas>=2.0
+pyarrow>=12.0
+matplotlib>=3.7
+safetensors>=0.4
+transformers>=4.38        # AutoTokenizer only
+requests>=2.28            # data download scripts only, never at train time
