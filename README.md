@@ -189,6 +189,34 @@ Training keeps working meanwhile — the agents just use the numeric prior, whic
 is always available. Nothing is lost by starting now and re-syncing later: the
 advisor cache is keyed by (coin, day) and fills in whenever the model appears.
 
+### If an agent dies with `sqlite3.OperationalError: disk I/O error`
+
+Fixed — pull the latest `src/llm/advisor.py`. The workspace mount does not
+support the shared-memory locking SQLite's WAL journal needs. The cache now
+negotiates storage at startup (WAL → TRUNCATE → DELETE → MEMORY → a different
+directory → a lock-free append-only JSONL file) and reports which backend it
+chose. To force the lock-free path:
+
+```bash
+TRADER_V4_CACHE_BACKEND=jsonl python train.py --epochs 2000
+# or just put the cache on local disk:
+python train.py --cache-path /tmp/trader_v4_advisor.sqlite
+```
+
+### Memory budget
+
+Per agent process, once warm: ~350–450 MB (torch + the parquet LRU + matplotlib's
+glyph caches, which plateau after ~10 renders and then stay flat). The CPU advisor
+daemon adds ~4 GB in int4 mode, or ~14 GB with `--llm-materialize --llm-dtype
+bfloat16`. Budget roughly:
+
+```
+RAM needed ≈ 0.5 GB × n_agents + (4 GB | 14 GB if materialized) + 1 GB headroom
+```
+
+Running many agents on a small-RAM box will swap and epochs will crawl — that is
+the usual cause of a sudden 100×-slower epoch.
+
 ### Tuning for your instance
 
 On a single **A10G (24 GB) + 8 vCPU** node:
