@@ -12,9 +12,14 @@ from datetime import datetime, timezone
 
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.dates as mdates  # noqa: E402
-import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
+# Deliberately the object-oriented API, not pyplot.  pyplot keeps every figure
+# in a process-global registry; in worker processes that render thousands of
+# images it is easy to retain figures by accident, and the registry is not
+# meant to be touched from multiple processes.  Figure + FigureCanvasAgg has
+# no global state, so a figure is freed the moment it goes out of scope.
+from matplotlib.backends.backend_agg import FigureCanvasAgg  # noqa: E402
+from matplotlib.figure import Figure  # noqa: E402
 from matplotlib.gridspec import GridSpec  # noqa: E402
 
 BG = "#11141a"
@@ -26,7 +31,7 @@ BLUE = "#4da3ff"
 AMBER = "#ffb84d"
 PURPLE = "#b07cff"
 
-plt.rcParams.update({
+matplotlib.rcParams.update({
     "figure.facecolor": BG, "axes.facecolor": BG, "savefig.facecolor": BG,
     "text.color": FG, "axes.labelcolor": FG, "axes.edgecolor": GRID,
     "xtick.color": "#9aa3b2", "ytick.color": "#9aa3b2",
@@ -64,7 +69,8 @@ def render_epoch(path: str, *, epoch: int, agent_id: int, run_name: str,
     train_stats : PPO diagnostics
     """
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    fig = plt.figure(figsize=(19, 12.2), dpi=104)
+    fig = Figure(figsize=(19, 12.2), dpi=104)
+    FigureCanvasAgg(fig)
     gs = GridSpec(4, 3, figure=fig, hspace=0.42, wspace=0.20,
                   left=0.045, right=0.985, top=0.915, bottom=0.05)
 
@@ -129,18 +135,19 @@ def render_epoch(path: str, *, epoch: int, agent_id: int, run_name: str,
         ax.text(0.02, y, k, fontsize=8.5, color="#9aa3b2", va="top")
         ax.text(0.52, y, v, fontsize=8.5, color=c, va="top", fontweight="bold")
         y -= 0.072
-    why = str(a.get("rationale", ""))[:70]
+    why = str(a.get("rationale", ""))[:60]
     if why:
-        ax.text(0.02, y - 0.01, f'"{why}"', fontsize=8, color="#9aa3b2",
-                va="top", style="italic", wrap=True)
-        y -= 0.07
-    y -= 0.03
-    ax.text(0.02, y, "headlines used (strictly pre-day):", fontsize=8,
-            color="#7a8396", va="top")
-    y -= 0.055
-    for h in (record.headlines or [])[:5]:
-        ax.text(0.02, y, "· " + h[:58], fontsize=7.3, color="#c3cad6", va="top")
-        y -= 0.05
+        ax.text(0.02, y - 0.01, f'"{why}"', fontsize=7.8, color="#9aa3b2",
+                va="top", style="italic")
+        y -= 0.075
+    y -= 0.045
+    ax.text(0.02, y, "HEADLINES READ (strictly pre-day)", fontsize=7.8,
+            color="#7a8396", va="top", fontweight="bold")
+    y -= 0.075
+    for h in (record.headlines or [])[:6]:
+        ax.text(0.02, y, "\u00b7 " + h[:56], fontsize=7.2, color="#c3cad6",
+                va="top")
+        y -= 0.058
     if not record.headlines:
         ax.text(0.02, y, "· (none available for this date)", fontsize=7.3,
                 color="#6b7383", va="top")
@@ -292,6 +299,6 @@ def render_epoch(path: str, *, epoch: int, agent_id: int, run_name: str,
 
     tmp = path + ".tmp.png"
     fig.savefig(tmp, facecolor=BG)
-    plt.close(fig)
+    fig.clear()
     os.replace(tmp, path)
     return path
