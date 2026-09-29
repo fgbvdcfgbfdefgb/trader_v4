@@ -111,9 +111,16 @@ class AdvisorSignal:
 #  timeline-safe headline selection
 # --------------------------------------------------------------------------- #
 def select_headlines(store, coin: str, day: date, lookback_days: int = 2,
-                     limit: int = 14) -> list[dict]:
+                     limit: int = 14, min_items: int = 3,
+                     market_proxy: str = "BTC") -> list[dict]:
     """
-    Headlines GDELT first saw in [day-lookback, day-1].  Never day itself.
+    Headlines first seen in [day-lookback, day-1].  Never day itself.
+
+    If the coin's own coverage for those days is thin (common for LTC, which
+    the news sources barely mention), we top up with BTC headlines tagged as
+    market context.  That is not a fudge: alts are overwhelmingly driven by
+    BTC beta, so market-wide news is genuinely the relevant information for
+    an LTC day with no LTC-specific story.
 
     Raises if anything dated >= `day` slips through -- a loud failure is much
     better than silent look-ahead leakage that inflates backtest PnL.
@@ -123,6 +130,18 @@ def select_headlines(store, coin: str, day: date, lookback_days: int = 2,
         d = day - timedelta(days=back)
         for h in store.get(coin, d):
             out.append(h)
+
+    if len(out) < min_items and coin != market_proxy:
+        seen = {h.get("t", "")[:80] for h in out}
+        for back in range(1, lookback_days + 1):
+            d = day - timedelta(days=back)
+            for h in store.get(market_proxy, d):
+                if h.get("t", "")[:80] in seen:
+                    continue
+                g = dict(h)
+                g["src"] = (g.get("src", "") + " (market)").strip()
+                out.append(g)
+
     for h in out:
         ts = h.get("ts", "")
         if ts and ts[:8] >= day.strftime("%Y%m%d"):
